@@ -5,14 +5,15 @@ PicLUT - 主应用程序
 
 import sys
 import os
+import shutil
 import cv2
 import numpy as np
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QTextEdit, QFileDialog
+    QPushButton, QTextEdit, QFileDialog, QListWidget, QListWidgetItem, QLabel
 )
-from PySide6.QtCore import Slot
+from PySide6.QtCore import Slot, Qt
 
 # 导入自定义模块
 from lut_processing import parse_cube_lut, ImageProcessingThread
@@ -37,6 +38,9 @@ class LutAppWindow(QMainWindow):
         self.loaded_images = []  # 存储加载的图片数据
         self.batch_mode = False  # 是否处于批处理模式
 
+        # LUT 目录
+        self._ensure_lut_dirs()
+
         self._init_ui()
         self._apply_theme()
 
@@ -48,6 +52,41 @@ class LutAppWindow(QMainWindow):
         main_layout.setSpacing(15)
         main_layout.setContentsMargins(20, 20, 20, 20)
 
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(15)
+        main_layout.addLayout(content_layout, stretch=1)
+
+        # 左侧 LUT 管理面板
+        lut_panel = QVBoxLayout()
+        lut_panel.setSpacing(10)
+
+        lbl_lut_title = QLabel("LUT 管理")
+        lbl_lut_title.setStyleSheet("font-size: 15px; font-weight: 600;")
+
+        self.lut_list = QListWidget()
+        self.lut_list.setMinimumWidth(220)
+        self.lut_list.itemDoubleClicked.connect(self.on_lut_double_clicked)
+
+        lut_btn_layout = QHBoxLayout()
+        self.btn_add_lut = QPushButton("添加LUT")
+        self.btn_del_lut = QPushButton("删除LUT")
+        for btn in [self.btn_add_lut, self.btn_del_lut]:
+            btn.setMinimumHeight(36)
+        self.btn_add_lut.clicked.connect(self.on_add_lut)
+        self.btn_del_lut.clicked.connect(self.on_delete_lut)
+        lut_btn_layout.addWidget(self.btn_add_lut)
+        lut_btn_layout.addWidget(self.btn_del_lut)
+
+        lut_panel.addWidget(lbl_lut_title)
+        lut_panel.addWidget(self.lut_list, stretch=1)
+        lut_panel.addLayout(lut_btn_layout)
+
+        content_layout.addLayout(lut_panel, stretch=0)
+
+        # 右侧主内容区域
+        right_layout = QVBoxLayout()
+        right_layout.setSpacing(15)
+
         # 1. 图像预览区域
         preview_layout = QHBoxLayout()
         preview_layout.setSpacing(15)
@@ -58,7 +97,7 @@ class LutAppWindow(QMainWindow):
         preview_layout.addWidget(self.lbl_source, stretch=1)
         preview_layout.addWidget(self.lbl_result, stretch=1)
 
-        main_layout.addLayout(preview_layout, stretch=1)
+        right_layout.addLayout(preview_layout, stretch=1)
 
         # 2. 控制按钮区域
         btn_layout = QHBoxLayout()
@@ -85,13 +124,18 @@ class LutAppWindow(QMainWindow):
             btn.setMinimumHeight(45)
             btn_layout.addWidget(btn)
 
-        main_layout.addLayout(btn_layout)
+        right_layout.addLayout(btn_layout)
 
         # 3. 日志输出区域
         self.log_viewer = QTextEdit()
         self.log_viewer.setReadOnly(True)
         self.log_viewer.setMaximumHeight(120)
-        main_layout.addWidget(self.log_viewer)
+        right_layout.addWidget(self.log_viewer)
+
+        content_layout.addLayout(right_layout, stretch=1)
+
+        # 初始化列表
+        self._load_lut_list()
 
     def _apply_theme(self):
         """应用暗色系样式表"""
@@ -110,6 +154,17 @@ class LutAppWindow(QMainWindow):
             QPushButton:hover { background-color: #4a4a4a; border-color: #666; }
             QPushButton:pressed { background-color: #2a2a2a; border-color: #444; }
             QPushButton:disabled { background-color: #252525; color: #666; border-color: #333; }
+
+            QListWidget {
+                background-color: #252526;
+                border: 1px solid #333;
+                border-radius: 6px;
+                color: #e0e0e0;
+                padding: 4px;
+            }
+            QListWidget::item { padding: 6px 8px; }
+            QListWidget::item:selected { background-color: #3a3a3a; color: #ffffff; }
+            QListWidget::item:hover { background-color: #333; }
 
             QTextEdit {
                 background-color: #252526;
@@ -135,6 +190,102 @@ class LutAppWindow(QMainWindow):
         # 自动滚动到底部
         scrollbar = self.log_viewer.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    # ==================== LUT 管理 ====================
+
+    def _ensure_lut_dirs(self):
+        """确保 LUT 基础目录和自定义目录存在"""
+        base_dir = os.path.join(os.path.dirname(__file__), "LUT")
+        custom_dir = os.path.join(base_dir, "Custom")
+        os.makedirs(base_dir, exist_ok=True)
+        os.makedirs(custom_dir, exist_ok=True)
+        self.lut_base_dir = base_dir
+        self.custom_lut_dir = custom_dir
+
+    def _load_lut_list(self):
+        """加载 LUT 列表（内置 + 自定义）"""
+        self.lut_list.clear()
+        if not os.path.isdir(self.lut_base_dir):
+            return
+
+        lut_files = []
+        for root, _, files in os.walk(self.lut_base_dir):
+            for name in files:
+                if name.lower().endswith('.cube'):
+                    lut_files.append((root, name))
+
+        lut_files.sort(key=lambda x: x[1].lower())
+
+        for root, name in lut_files:
+            full_path = os.path.join(root, name)
+            try:
+                is_custom = os.path.commonpath([self.custom_lut_dir, full_path]) == self.custom_lut_dir
+            except ValueError:
+                is_custom = False
+            prefix = "自定义" if is_custom else "内置"
+            rel = os.path.relpath(full_path, self.lut_base_dir)
+            item = QListWidgetItem(f"[{prefix}] {rel}")
+            item.setData(Qt.UserRole, full_path)
+            self.lut_list.addItem(item)
+
+    @Slot()
+    def on_add_lut(self):
+        """添加自定义 LUT 到本地目录"""
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "添加 LUT", "", "LUT Files (*.cube)")
+        if not file_paths:
+            return
+
+        added = 0
+        for src in file_paths:
+            try:
+                filename = os.path.basename(src)
+                target = os.path.join(self.custom_lut_dir, filename)
+
+                # 避免重名覆盖
+                base, ext = os.path.splitext(target)
+                counter = 1
+                while os.path.exists(target):
+                    target = f"{base}_{counter}{ext}"
+                    counter += 1
+
+                shutil.copy2(src, target)
+                added += 1
+            except Exception as e:
+                self.log(f"[错误] 添加失败: {os.path.basename(src)} - {e}")
+
+        if added:
+            self.log(f"已添加 {added} 个 LUT 到本地库")
+            self._load_lut_list()
+
+    @Slot()
+    def on_delete_lut(self):
+        """删除自定义目录中的 LUT"""
+        item = self.lut_list.currentItem()
+        if not item:
+            self.log("[警告] 请先选择要删除的 LUT")
+            return
+
+        path = item.data(Qt.UserRole)
+        if not path.startswith(self.custom_lut_dir):
+            self.log("[警告] 仅支持删除自定义目录中的 LUT")
+            return
+
+        try:
+            os.remove(path)
+            self.log(f"已删除 LUT: {os.path.basename(path)}")
+            self._load_lut_list()
+        except Exception as e:
+            self.log(f"[错误] 删除失败: {e}")
+
+    @Slot(object)
+    def on_lut_double_clicked(self, item):
+        """双击列表加载并选择 LUT"""
+        path = item.data(Qt.UserRole)
+        try:
+            self.lut_table, self.lut_size = parse_cube_lut(path)
+            self.log(f"已选择 LUT: {os.path.basename(path)} (尺寸: {self.lut_size}^3)")
+        except Exception as e:
+            self.log(f"[错误] 加载 LUT 失败: {e}")
 
     # ==================== 槽函数 (业务逻辑) ====================
 
