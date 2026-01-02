@@ -1,173 +1,23 @@
+"""
+PicLUT - 主应用程序
+图像 LUT 处理工具的主窗口和程序入口
+"""
+
 import sys
 import os
 import cv2
 import numpy as np
-from PIL import Image, ImageFilter
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QTextEdit, QFileDialog, QSizePolicy
+    QPushButton, QTextEdit, QFileDialog
 )
-from PySide6.QtGui import QImage, QPixmap, QPainter
-from PySide6.QtCore import Qt, QThread, Signal, Slot
+from PySide6.QtCore import Slot
 
+# 导入自定义模块
+from lut_processing import parse_cube_lut, ImageProcessingThread
+from gui_components import AutoResizingLabel
 
-# ==================== 工具函数 ====================
-
-def parse_cube_lut(file_path):
-    """
-    解析 .cube 格式的 3D LUT 文件。
-
-    Args:
-        file_path (str): .cube 文件路径
-
-    Returns:
-        tuple: (lut_table_list, size)
-               lut_table_list 为扁平化的浮点列表，size 为 LUT 的维度 (N)
-    """
-    lut_table = []
-    size = 0
-
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                # 跳过空行和注释
-                if not line or line.startswith('#'):
-                    continue
-                # 解析尺寸定义
-                if line.startswith('LUT_3D_SIZE'):
-                    size = int(line.split()[-1])
-                    continue
-                # 解析数据点 (检查是否以数字或负号开头)
-                if line[0].isdigit() or line[0] == '-':
-                    parts = line.split()
-                    lut_table.extend([float(v) for v in parts])
-
-        if size == 0:
-            raise ValueError("未找到 LUT_3D_SIZE 定义")
-        if len(lut_table) != size * size * size * 3:
-            raise ValueError(f"数据点数量不匹配。预期: {size ** 3 * 3}, 实际: {len(lut_table)}")
-
-        return lut_table, size
-
-    except UnicodeDecodeError:
-        # 尝试使用 latin-1 再次读取，防止某些特殊编码文件报错
-        with open(file_path, 'r', encoding='latin-1') as f:
-            # 简化重复逻辑，实际生产中可封装
-            pass
-        raise ValueError("文件编码格式不支持")
-
-
-# ==================== 工作线程 ====================
-
-class ImageProcessingThread(QThread):
-    """
-    后台图像处理线程，防止阻塞 UI 主线程。
-    使用 Pillow 的 C 语言底层滤镜进行加速。
-    """
-    processing_finished = Signal(object)  # 成功信号，携带处理后的 OpenCV 图像
-    processing_error = Signal(str)  # 失败信号，携带错误信息
-
-    def __init__(self, source_img, lut_table, lut_size):
-        super().__init__()
-        self.source_img = source_img
-        self.lut_table = lut_table
-        self.lut_size = lut_size
-
-    def run(self):
-        try:
-            # 1. 颜色空间转换: OpenCV (BGR) -> Pillow (RGB)
-            img_rgb = cv2.cvtColor(self.source_img, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(img_rgb)
-
-            # 2. 构建 3D LUT 滤镜
-            lut_filter = ImageFilter.Color3DLUT(
-                size=self.lut_size,
-                table=self.lut_table,
-                channels=3,
-                target_mode=None
-            )
-
-            # 3. 应用滤镜 (计算密集型步骤)
-            processed_pil = pil_image.filter(lut_filter)
-
-            # 4. 转换回 OpenCV 格式: Pillow (RGB) -> OpenCV (BGR)
-            processed_np = np.asarray(processed_pil)
-            result_bgr = cv2.cvtColor(processed_np, cv2.COLOR_RGB2BGR)
-
-            self.processing_finished.emit(result_bgr)
-
-        except Exception as e:
-            self.processing_error.emit(str(e))
-
-
-# ==================== 自定义控件 ====================
-
-class AutoResizingLabel(QLabel):
-    """
-    自定义 QLabel，支持根据窗口大小自动缩放显示的图像。
-    避免了标准 QLabel 被高分辨率图像撑大导致窗口无法缩小的问题。
-    """
-
-    def __init__(self, placeholder_text=""):
-        super().__init__(placeholder_text)
-        self.setAlignment(Qt.AlignCenter)
-        self.setStyleSheet("""
-            QLabel {
-                border: 2px dashed #444; 
-                background-color: #2b2b2b; 
-                color: #888; 
-                font-size: 14px;
-                font-family: Arial;
-            }
-        """)
-        # 忽略内容尺寸，允许布局管理器自由压缩或拉伸此控件
-        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self._pixmap = None
-
-    def set_image(self, cv_img):
-        """
-        设置要显示的 OpenCV 图像。
-        """
-        if cv_img is None:
-            return
-
-        # BGR -> RGB -> QImage -> QPixmap
-        rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        bytes_per_line = ch * w
-        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-
-        # 保存原始分辨率的 Pixmap，用于动态重绘
-        self._pixmap = QPixmap.fromImage(qimg)
-        self.update()  # 触发 paintEvent
-
-    def paintEvent(self, event):
-        """
-        动态绘制事件。根据控件当前的实时尺寸缩放并居中绘制图像。
-        """
-        if not self._pixmap:
-            super().paintEvent(event)  # 显示占位文字
-            return
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform)  # 开启平滑抗锯齿
-
-        # 计算适应当前窗口的尺寸 (保持纵横比)
-        target_size = self.size()
-        scaled_pixmap = self._pixmap.scaled(
-            target_size, Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-
-        # 计算居中坐标
-        x = (target_size.width() - scaled_pixmap.width()) // 2
-        y = (target_size.height() - scaled_pixmap.height()) // 2
-
-        painter.drawPixmap(x, y, scaled_pixmap)
-
-
-# ==================== 主窗口 ====================
 
 class LutAppWindow(QMainWindow):
     def __init__(self):
@@ -181,6 +31,11 @@ class LutAppWindow(QMainWindow):
         self.lut_table = None
         self.lut_size = None
         self.worker_thread = None
+        
+        # 批处理状态
+        self.image_paths = []  # 存储所有选择的图片路径
+        self.loaded_images = []  # 存储加载的图片数据
+        self.batch_mode = False  # 是否处于批处理模式
 
         self._init_ui()
         self._apply_theme()
@@ -211,17 +66,22 @@ class LutAppWindow(QMainWindow):
 
         self.btn_open_img = QPushButton("打开图片")
         self.btn_open_lut = QPushButton("导入 LUT (.cube)")
+        self.btn_preview = QPushButton("预览效果")
         self.btn_process = QPushButton("应用处理")
         self.btn_save = QPushButton("导出结果")
 
         # 绑定信号
         self.btn_open_img.clicked.connect(self.on_open_image)
         self.btn_open_lut.clicked.connect(self.on_open_lut)
+        self.btn_preview.clicked.connect(self.on_preview)
         self.btn_process.clicked.connect(self.on_process_start)
         self.btn_save.clicked.connect(self.on_save_result)
+        
+        # 初始隐藏预览按钮
+        self.btn_preview.setVisible(False)
 
         # 设置按钮统一高度
-        for btn in [self.btn_open_img, self.btn_open_lut, self.btn_process, self.btn_save]:
+        for btn in [self.btn_open_img, self.btn_open_lut, self.btn_preview, self.btn_process, self.btn_save]:
             btn.setMinimumHeight(45)
             btn_layout.addWidget(btn)
 
@@ -280,14 +140,17 @@ class LutAppWindow(QMainWindow):
 
     @Slot()
     def on_open_image(self):
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择图片", "",
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择图片（可多选）", "",
             "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)"
         )
-        if file_path:
+        if file_paths:
             try:
-                # 使用 imdecode 处理包含非 ASCII 字符的路径
-                data = np.fromfile(file_path, dtype=np.uint8)
+                self.image_paths = file_paths
+                self.loaded_images = []
+                
+                # 加载第一张图片用于预览
+                data = np.fromfile(file_paths[0], dtype=np.uint8)
                 image = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
 
                 if image is None:
@@ -299,7 +162,17 @@ class LutAppWindow(QMainWindow):
 
                 self.source_image = image
                 self.lbl_source.set_image(self.source_image)
-                self.log(f"已加载图像: {os.path.basename(file_path)}")
+                
+                # 判断是否为批处理模式
+                if len(file_paths) > 1:
+                    self.batch_mode = True
+                    self.btn_preview.setVisible(True)
+                    self.log(f"已选择 {len(file_paths)} 张图像，显示第一张预览")
+                    self.log("提示：点击'预览效果'查看第一张图片的LUT效果")
+                else:
+                    self.batch_mode = False
+                    self.btn_preview.setVisible(False)
+                    self.log(f"已加载图像: {os.path.basename(file_paths[0])}")
 
             except Exception as e:
                 self.log(f"[错误] 加载图像失败: {e}")
@@ -313,6 +186,37 @@ class LutAppWindow(QMainWindow):
                 self.log(f"已加载 LUT: {os.path.basename(file_path)} (尺寸: {self.lut_size}^3)")
             except Exception as e:
                 self.log(f"[错误] 解析 LUT 失败: {e}")
+    
+    @Slot()
+    def on_preview(self):
+        """预览第一张图片的LUT效果"""
+        if self.source_image is None:
+            self.log("[警告] 请先加载图像")
+            return
+        if self.lut_table is None:
+            self.log("[警告] 请先加载 LUT 文件")
+            return
+        
+        self.btn_preview.setEnabled(False)
+        self.btn_preview.setText("预览中...")
+        self.log("正在预览第一张图片的效果...")
+        
+        # 启动后台线程处理预览
+        self.worker_thread = ImageProcessingThread(
+            self.source_image, self.lut_table, self.lut_size
+        )
+        self.worker_thread.processing_finished.connect(self.on_preview_finished)
+        self.worker_thread.processing_error.connect(self.on_process_error)
+        self.worker_thread.start()
+    
+    @Slot(object)
+    def on_preview_finished(self, result_image):
+        """预览完成"""
+        self.processed_image = result_image
+        self.lbl_result.set_image(self.processed_image)
+        self.log("预览完成，如果效果满意可点击'应用处理'批量处理所有图片")
+        self.btn_preview.setEnabled(True)
+        self.btn_preview.setText("预览效果")
 
     @Slot()
     def on_process_start(self):
@@ -325,15 +229,30 @@ class LutAppWindow(QMainWindow):
 
         self.btn_process.setEnabled(False)
         self.btn_process.setText("正在处理...")
-        self.log("开始应用 3D LUT，请稍候...")
-
-        # 启动后台线程
-        self.worker_thread = ImageProcessingThread(
-            self.source_image, self.lut_table, self.lut_size
-        )
-        self.worker_thread.processing_finished.connect(self.on_process_finished)
-        self.worker_thread.processing_error.connect(self.on_process_error)
-        self.worker_thread.start()
+        
+        if self.batch_mode:
+            # 批处理模式
+            self.log(f"开始批量处理 {len(self.image_paths)} 张图片...")
+            
+            # 导入批处理线程
+            from lut_processing import BatchProcessingThread
+            
+            self.worker_thread = BatchProcessingThread(
+                self.image_paths, self.lut_table, self.lut_size
+            )
+            self.worker_thread.progress_update.connect(self.on_batch_progress)
+            self.worker_thread.processing_finished.connect(self.on_batch_finished)
+            self.worker_thread.processing_error.connect(self.on_process_error)
+            self.worker_thread.start()
+        else:
+            # 单张处理模式
+            self.log("开始应用 3D LUT，请稍候...")
+            self.worker_thread = ImageProcessingThread(
+                self.source_image, self.lut_table, self.lut_size
+            )
+            self.worker_thread.processing_finished.connect(self.on_process_finished)
+            self.worker_thread.processing_error.connect(self.on_process_error)
+            self.worker_thread.start()
 
     @Slot(object)
     def on_process_finished(self, result_image):
@@ -341,6 +260,27 @@ class LutAppWindow(QMainWindow):
         self.lbl_result.set_image(self.processed_image)
         self.log("处理完成")
         self._reset_process_btn()
+    
+    @Slot(str)
+    def on_batch_progress(self, message):
+        """批处理进度更新"""
+        self.log(message)
+    
+    @Slot(list)
+    def on_batch_finished(self, processed_images):
+        """批处理完成"""
+        self.loaded_images = processed_images
+        
+        # 显示第一张处理后的图片
+        if processed_images:
+            self.processed_image = processed_images[0]
+            self.lbl_result.set_image(self.processed_image)
+        
+        self.log(f"批量处理完成！共处理 {len(processed_images)} 张图片")
+        self._reset_process_btn()
+        
+        # 自动弹出保存对话框
+        self.on_batch_save()
 
     @Slot(str)
     def on_process_error(self, error_msg):
@@ -353,37 +293,77 @@ class LutAppWindow(QMainWindow):
 
     @Slot()
     def on_save_result(self):
-        if self.processed_image is None:
+        if self.batch_mode and self.loaded_images:
+            # 批处理模式，调用批量保存
+            self.on_batch_save()
+        elif self.processed_image is not None:
+            # 单张保存模式
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "保存图像", "",
+                "PNG Image (*.png);;JPEG Image (*.jpg);;TIFF Image (*.tiff)"
+            )
+
+            if file_path:
+                try:
+                    # 自动补全后缀
+                    valid_extensions = ['.png', '.jpg', '.jpeg', '.tiff', '.tif']
+                    ext = os.path.splitext(file_path)[1].lower()
+                    if not ext or ext not in valid_extensions:
+                        file_path += ".png"
+                        ext = ".png"
+
+                    # 使用 imencode 处理中文路径保存
+                    is_success, buffer = cv2.imencode(ext, self.processed_image)
+                    if is_success:
+                        with open(file_path, "wb") as f:
+                            buffer.tofile(f)
+                        self.log(f"已保存至: {file_path}")
+                    else:
+                        self.log("[错误] 图像编码失败")
+                except Exception as e:
+                    self.log(f"[错误] 保存失败: {e}")
+        else:
+            self.log("[警告] 没有可保存的处理结果")
+    
+    def on_batch_save(self):
+        """批量保存处理后的图片"""
+        if not self.loaded_images:
             self.log("[警告] 没有可保存的处理结果")
             return
-
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "保存图像", "",
-            "PNG Image (*.png);;JPEG Image (*.jpg);;TIFF Image (*.tiff)"
+        
+        # 选择保存文件夹
+        save_dir = QFileDialog.getExistingDirectory(
+            self, "选择保存文件夹", "",
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
         )
-
-        if file_path:
+        
+        if save_dir:
             try:
-                # 自动补全后缀
-                valid_extensions = ['.png', '.jpg', '.jpeg', '.tiff', '.tif']
-                ext = os.path.splitext(file_path)[1].lower()
-                if not ext or ext not in valid_extensions:
-                    file_path += ".png"
-                    ext = ".png"
-
-                # 使用 imencode 处理中文路径保存
-                is_success, buffer = cv2.imencode(ext, self.processed_image)
-                if is_success:
-                    with open(file_path, "wb") as f:
-                        buffer.tofile(f)
-                    self.log(f"已保存至: {file_path}")
-                else:
-                    self.log("[错误] 图像编码失败")
+                success_count = 0
+                for i, (img, original_path) in enumerate(zip(self.loaded_images, self.image_paths)):
+                    # 获取原文件名
+                    base_name = os.path.basename(original_path)
+                    name, ext = os.path.splitext(base_name)
+                    
+                    # 生成新文件名（添加_lut后缀）
+                    new_name = f"{name}_lut{ext}"
+                    save_path = os.path.join(save_dir, new_name)
+                    
+                    # 保存图片
+                    is_success, buffer = cv2.imencode(ext if ext else '.png', img)
+                    if is_success:
+                        with open(save_path, "wb") as f:
+                            buffer.tofile(f)
+                        success_count += 1
+                    else:
+                        self.log(f"[错误] 编码失败: {base_name}")
+                
+                self.log(f"批量保存完成！成功保存 {success_count}/{len(self.loaded_images)} 张图片")
+                self.log(f"保存位置: {save_dir}")
+                
             except Exception as e:
-                self.log(f"[错误] 保存失败: {e}")
+                self.log(f"[错误] 批量保存失败: {e}")
 
-
-# ==================== 程序入口 ====================
 
 if __name__ == "__main__":
     # 创建应用程序实例
