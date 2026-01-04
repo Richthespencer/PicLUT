@@ -54,7 +54,7 @@ def parse_cube_lut(file_path):
         raise ValueError("文件编码格式不支持")
 
 
-def apply_lut_to_image(source_img, lut_table, lut_size):
+def apply_lut_to_image(source_img, lut_table, lut_size, strength=1.0):
     """
     将 3D LUT 应用到图像上。
 
@@ -62,6 +62,7 @@ def apply_lut_to_image(source_img, lut_table, lut_size):
         source_img: OpenCV BGR 格式的图像
         lut_table: LUT 数据表
         lut_size: LUT 维度大小
+        strength: LUT 强度 (0.0-1.0)，1.0为完全应用
 
     Returns:
         处理后的 OpenCV BGR 格式图像
@@ -84,6 +85,10 @@ def apply_lut_to_image(source_img, lut_table, lut_size):
     # 4. 转换回 OpenCV 格式: Pillow (RGB) -> OpenCV (BGR)
     processed_np = np.asarray(processed_pil)
     result_bgr = cv2.cvtColor(processed_np, cv2.COLOR_RGB2BGR)
+    
+    # 5. 根据强度混合原图和处理后的图
+    if strength < 1.0:
+        result_bgr = cv2.addWeighted(source_img, 1.0 - strength, result_bgr, strength, 0)
 
     return result_bgr
 
@@ -96,18 +101,20 @@ class ImageProcessingThread(QThread):
     processing_finished = Signal(object)  # 成功信号，携带处理后的 OpenCV 图像
     processing_error = Signal(str)  # 失败信号，携带错误信息
 
-    def __init__(self, source_img, lut_table, lut_size):
+    def __init__(self, source_img, lut_table, lut_size, strength=1.0):
         super().__init__()
         self.source_img = source_img
         self.lut_table = lut_table
         self.lut_size = lut_size
+        self.strength = strength
 
     def run(self):
         try:
             result_bgr = apply_lut_to_image(
                 self.source_img, 
                 self.lut_table, 
-                self.lut_size
+                self.lut_size,
+                self.strength
             )
             self.processing_finished.emit(result_bgr)
 
@@ -123,11 +130,12 @@ class BatchProcessingThread(QThread):
     processing_error = Signal(str)  # 失败信号，携带错误信息
     progress_update = Signal(str)  # 进度更新信号
     
-    def __init__(self, image_paths, lut_table, lut_size):
+    def __init__(self, image_paths, lut_table, lut_size, strength=1.0):
         super().__init__()
         self.image_paths = image_paths
         self.lut_table = lut_table
         self.lut_size = lut_size
+        self.strength = strength
     
     def run(self):
         try:
@@ -148,7 +156,7 @@ class BatchProcessingThread(QThread):
                         image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
                     
                     # 应用 LUT
-                    result = apply_lut_to_image(image, self.lut_table, self.lut_size)
+                    result = apply_lut_to_image(image, self.lut_table, self.lut_size, self.strength)
                     processed_images.append(result)
                     
                     # 发送进度更新

@@ -6,14 +6,17 @@ PicLUT - 主应用程序
 import sys
 import os
 import shutil
+import json
 import cv2
 import numpy as np
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QTextEdit, QFileDialog, QListWidget, QListWidgetItem, QLabel
+    QPushButton, QTextEdit, QFileDialog, QListWidget, QListWidgetItem, QLabel,
+    QMenu, QInputDialog, QTreeWidget, QTreeWidgetItem, QSlider
 )
-from PySide6.QtCore import Slot, Qt
+from PySide6.QtCore import Slot, Qt, QTimer
+from PySide6.QtGui import QAction, QIcon
 
 # 导入自定义模块
 from lut_processing import parse_cube_lut, ImageProcessingThread
@@ -37,12 +40,30 @@ class LutAppWindow(QMainWindow):
         self.image_paths = []  # 存储所有选择的图片路径
         self.loaded_images = []  # 存储加载的图片数据
         self.batch_mode = False  # 是否处于批处理模式
+        
+        # LUT 强度
+        self.lut_strength = 1.0  # 默认100%
+        self.last_preview_strength = None  # 最近一次预览使用的强度
 
         # LUT 目录
         self._ensure_lut_dirs()
+        self.config_file = os.path.join(self.lut_base_dir, '.lut_config.json')
+        self.pinned_luts = self._load_config()
+        
+        # 文件系统监视定时器
+        self.lut_refresh_timer = QTimer(self)
+        self.lut_refresh_timer.timeout.connect(self._refresh_lut_tree)
+        self.lut_refresh_timer.start(3000)  # 每3秒检查一次
+        self._last_lut_mtime = 0
+
+        # 预览与滑条强度同步定时器
+        self.preview_sync_timer = QTimer(self)
+        self.preview_sync_timer.setInterval(200)
+        self.preview_sync_timer.timeout.connect(self._ensure_preview_synced)
 
         self._init_ui()
         self._apply_theme()
+        self.preview_sync_timer.start()
 
     def _init_ui(self):
         """初始化 UI 布局"""
@@ -63,9 +84,12 @@ class LutAppWindow(QMainWindow):
         lbl_lut_title = QLabel("LUT 管理")
         lbl_lut_title.setStyleSheet("font-size: 15px; font-weight: 600;")
 
-        self.lut_list = QListWidget()
-        self.lut_list.setMinimumWidth(220)
-        self.lut_list.itemDoubleClicked.connect(self.on_lut_double_clicked)
+        self.lut_tree = QTreeWidget()
+        self.lut_tree.setMinimumWidth(250)
+        self.lut_tree.setHeaderHidden(True)
+        self.lut_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.lut_tree.customContextMenuRequested.connect(self.on_lut_context_menu)
+        self.lut_tree.itemDoubleClicked.connect(self.on_lut_double_clicked)
 
         lut_btn_layout = QHBoxLayout()
         self.btn_add_lut = QPushButton("添加LUT")
@@ -78,7 +102,7 @@ class LutAppWindow(QMainWindow):
         lut_btn_layout.addWidget(self.btn_del_lut)
 
         lut_panel.addWidget(lbl_lut_title)
-        lut_panel.addWidget(self.lut_list, stretch=1)
+        lut_panel.addWidget(self.lut_tree, stretch=1)
         lut_panel.addLayout(lut_btn_layout)
 
         content_layout.addLayout(lut_panel, stretch=0)
@@ -98,6 +122,34 @@ class LutAppWindow(QMainWindow):
         preview_layout.addWidget(self.lbl_result, stretch=1)
 
         right_layout.addLayout(preview_layout, stretch=1)
+
+        # 1.5 LUT 强度滑块
+        strength_layout = QHBoxLayout()
+        strength_layout.setSpacing(10)
+        
+        self.lbl_strength_title = QLabel("LUT 强度:")
+        self.lbl_strength_value = QLabel("100%")
+        self.lbl_strength_value.setMinimumWidth(45)
+        self.lbl_strength_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        
+        self.strength_slider = QSlider(Qt.Horizontal)
+        self.strength_slider.setMinimum(0)
+        self.strength_slider.setMaximum(100)
+        self.strength_slider.setValue(100)
+        self.strength_slider.setTickPosition(QSlider.TicksBelow)
+        self.strength_slider.setTickInterval(10)
+        self.strength_slider.valueChanged.connect(self.on_strength_changed)
+        
+        strength_layout.addWidget(self.lbl_strength_title)
+        strength_layout.addWidget(self.strength_slider, stretch=1)
+        strength_layout.addWidget(self.lbl_strength_value)
+        
+        # 初始隐藏强度控制
+        self.lbl_strength_title.setVisible(False)
+        self.strength_slider.setVisible(False)
+        self.lbl_strength_value.setVisible(False)
+        
+        right_layout.addLayout(strength_layout)
 
         # 2. 控制按钮区域
         btn_layout = QHBoxLayout()
@@ -135,7 +187,7 @@ class LutAppWindow(QMainWindow):
         content_layout.addLayout(right_layout, stretch=1)
 
         # 初始化列表
-        self._load_lut_list()
+        self._load_lut_tree()
 
     def _apply_theme(self):
         """应用暗色系样式表"""
@@ -155,16 +207,80 @@ class LutAppWindow(QMainWindow):
             QPushButton:pressed { background-color: #2a2a2a; border-color: #444; }
             QPushButton:disabled { background-color: #252525; color: #666; border-color: #333; }
 
-            QListWidget {
+            QTreeWidget {
                 background-color: #252526;
                 border: 1px solid #333;
                 border-radius: 6px;
                 color: #e0e0e0;
                 padding: 4px;
+                outline: none;
+                show-decoration-selected: 0;
             }
-            QListWidget::item { padding: 6px 8px; }
-            QListWidget::item:selected { background-color: #3a3a3a; color: #ffffff; }
-            QListWidget::item:hover { background-color: #333; }
+            QTreeWidget::item { 
+                padding: 6px 4px;
+                border-radius: 3px;
+                outline: none;
+                border: none;
+            }
+            QTreeWidget::item:selected { 
+                background-color: #3a3a3a; 
+                color: #ffffff; 
+                outline: none;
+                border: none;
+            }
+            QTreeWidget::item:focus {
+                background-color: #3a3a3a;
+                outline: none;
+                border: none;
+            }
+            QTreeWidget::item:hover { 
+                background-color: #333; 
+            }
+            QTreeWidget::branch {
+                background: transparent;
+            }
+            QTreeWidget::branch:has-children:!has-siblings:closed,
+            QTreeWidget::branch:closed:has-children:has-siblings {
+                border-image: none;
+                image: none;
+            }
+            QTreeWidget::branch:open:has-children:!has-siblings,
+            QTreeWidget::branch:open:has-children:has-siblings {
+                border-image: none;
+                image: none;
+            }
+            QTreeWidget::branch:has-siblings:!adjoins-item {
+                border-image: none;
+            }
+            QTreeWidget::branch:has-siblings:adjoins-item {
+                border-image: none;
+            }
+            QTreeWidget::branch:!has-children:!has-siblings:adjoins-item {
+                border-image: none;
+            }
+            
+            QSlider::groove:horizontal {
+                border: 1px solid #333;
+                height: 6px;
+                background: #2b2b2b;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #4a9eff;
+                border: 1px solid #3a8eef;
+                width: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #5aafff;
+            }
+            QSlider::sub-page:horizontal {
+                background: #4a9eff;
+                border: 1px solid #333;
+                height: 6px;
+                border-radius: 3px;
+            }
 
             QTextEdit {
                 background-color: #252526;
@@ -201,32 +317,165 @@ class LutAppWindow(QMainWindow):
         os.makedirs(custom_dir, exist_ok=True)
         self.lut_base_dir = base_dir
         self.custom_lut_dir = custom_dir
+    
+    def _load_config(self):
+        """加载配置文件（置顶列表）"""
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    return set(config.get('pinned', []))
+            except:
+                return set()
+        return set()
+    
+    def _save_config(self):
+        """保存配置文件"""
+        try:
+            config = {'pinned': list(self.pinned_luts)}
+            with open(self.config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.log(f"[错误] 保存配置失败: {e}")
 
-    def _load_lut_list(self):
-        """加载 LUT 列表（内置 + 自定义）"""
-        self.lut_list.clear()
+    def _load_lut_tree(self):
+        """加载LUT树状结构（文件夹+文件）"""
+        # 保存当前展开状态
+        expanded_paths = self._get_expanded_paths()
+        
+        self.lut_tree.clear()
         if not os.path.isdir(self.lut_base_dir):
             return
-
-        lut_files = []
-        for root, _, files in os.walk(self.lut_base_dir):
-            for name in files:
-                if name.lower().endswith('.cube'):
-                    lut_files.append((root, name))
-
-        lut_files.sort(key=lambda x: x[1].lower())
-
-        for root, name in lut_files:
-            full_path = os.path.join(root, name)
-            try:
-                is_custom = os.path.commonpath([self.custom_lut_dir, full_path]) == self.custom_lut_dir
-            except ValueError:
-                is_custom = False
-            prefix = "自定义" if is_custom else "内置"
-            rel = os.path.relpath(full_path, self.lut_base_dir)
-            item = QListWidgetItem(f"[{prefix}] {rel}")
-            item.setData(Qt.UserRole, full_path)
-            self.lut_list.addItem(item)
+        
+        # 添加根目录的内容（置顶项会在目录内排在前面）
+        self._add_directory_contents(self.lut_tree, self.lut_base_dir, self.lut_base_dir)
+        
+        # 恢复展开状态
+        self._restore_expanded_paths(expanded_paths)
+    
+    def _get_expanded_paths(self):
+        """获取当前所有展开的文件夹路径"""
+        expanded = set()
+        
+        def collect_expanded(item):
+            if item.isExpanded():
+                path = item.data(0, Qt.UserRole)
+                item_type = item.data(0, Qt.UserRole + 2)
+                if path and item_type == "folder":
+                    expanded.add(path)
+            
+            for i in range(item.childCount()):
+                collect_expanded(item.child(i))
+        
+        root = self.lut_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            collect_expanded(root.child(i))
+        
+        return expanded
+    
+    def _restore_expanded_paths(self, expanded_paths):
+        """恢复文件夹的展开状态"""
+        if not expanded_paths:
+            return
+        
+        def restore_item(item):
+            path = item.data(0, Qt.UserRole)
+            item_type = item.data(0, Qt.UserRole + 2)
+            
+            if path in expanded_paths and item_type == "folder":
+                item.setExpanded(True)
+            
+            for i in range(item.childCount()):
+                restore_item(item.child(i))
+        
+        root = self.lut_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            restore_item(root.child(i))
+    
+    def _add_directory_contents(self, parent, dir_path, base_path):
+        """递归添加目录内容"""
+        try:
+            items = os.listdir(dir_path)
+        except PermissionError:
+            return
+        
+        # 过滤隐藏文件
+        items = [item for item in items if not item.startswith('.')]
+        
+        # 分类：文件夹和文件
+        folders = []
+        files = []
+        
+        for item_name in items:
+            item_path = os.path.join(dir_path, item_name)
+            
+            if os.path.isdir(item_path):
+                folders.append((item_name, item_path))
+            elif item_name.lower().endswith('.cube'):
+                files.append((item_name, item_path))
+        
+        # 按名称排序
+        folders.sort(key=lambda x: x[0].lower())
+        files.sort(key=lambda x: x[0].lower())
+        
+        # 分离置顶和非置顶文件
+        pinned_files = [(name, path) for name, path in files if path in self.pinned_luts]
+        unpinned_files = [(name, path) for name, path in files if path not in self.pinned_luts]
+        
+        # 先添加置顶文件
+        for item_name, item_path in pinned_files:
+            self._add_file_item(parent, item_path, is_pinned=True)
+        
+        # 再添加非置顶文件
+        for item_name, item_path in unpinned_files:
+            self._add_file_item(parent, item_path, is_pinned=False)
+        
+        # 最后添加文件夹（并递归处理其内容）
+        for item_name, item_path in folders:
+            folder_item = QTreeWidgetItem(parent, [f"📁 {item_name}"])
+            folder_item.setData(0, Qt.UserRole, item_path)
+            folder_item.setData(0, Qt.UserRole + 1, False)  # is_pinned
+            folder_item.setData(0, Qt.UserRole + 2, "folder")
+            folder_item.setExpanded(False)
+            
+            # 递归添加子内容
+            self._add_directory_contents(folder_item, item_path, base_path)
+    
+    def _add_file_item(self, parent, file_path, is_pinned=False):
+        """添加文件项"""
+        file_name = os.path.basename(file_path)
+        pin_icon = "📌 " if is_pinned else ""
+        display_name = f"{pin_icon}🎬 {file_name}"
+        
+        item = QTreeWidgetItem(parent, [display_name])
+        item.setData(0, Qt.UserRole, file_path)
+        item.setData(0, Qt.UserRole + 1, is_pinned)
+        item.setData(0, Qt.UserRole + 2, "file")
+    
+    def _refresh_lut_tree(self):
+        """检查文件系统变化并刷新树"""
+        try:
+            current_mtime = self._get_dir_mtime(self.lut_base_dir)
+            if current_mtime != self._last_lut_mtime:
+                self._last_lut_mtime = current_mtime
+                self._load_lut_tree()
+        except:
+            pass
+    
+    def _get_dir_mtime(self, dir_path):
+        """递归获取目录的最后修改时间"""
+        try:
+            mtime = os.path.getmtime(dir_path)
+            for root, dirs, files in os.walk(dir_path):
+                for d in dirs:
+                    if not d.startswith('.'):
+                        mtime = max(mtime, os.path.getmtime(os.path.join(root, d)))
+                for f in files:
+                    if f.endswith('.cube'):
+                        mtime = max(mtime, os.path.getmtime(os.path.join(root, f)))
+            return mtime
+        except:
+            return 0
 
     @Slot()
     def on_add_lut(self):
@@ -255,39 +504,311 @@ class LutAppWindow(QMainWindow):
 
         if added:
             self.log(f"已添加 {added} 个 LUT 到本地库")
-            self._load_lut_list()
+            self._load_lut_tree()
 
     @Slot()
     def on_delete_lut(self):
         """删除自定义目录中的 LUT"""
-        item = self.lut_list.currentItem()
+        item = self.lut_tree.currentItem()
         if not item:
             self.log("[警告] 请先选择要删除的 LUT")
             return
 
-        path = item.data(Qt.UserRole)
+        path = item.data(0, Qt.UserRole)
+        item_type = item.data(0, Qt.UserRole + 2)
+        
+        if not path or item_type != "file":
+            self.log("[警告] 请选择一个LUT文件")
+            return
+            
         if not path.startswith(self.custom_lut_dir):
             self.log("[警告] 仅支持删除自定义目录中的 LUT")
             return
 
         try:
             os.remove(path)
+            self.pinned_luts.discard(path)
+            self._save_config()
             self.log(f"已删除 LUT: {os.path.basename(path)}")
-            self._load_lut_list()
+            self._load_lut_tree()
         except Exception as e:
             self.log(f"[错误] 删除失败: {e}")
 
     @Slot(object)
-    def on_lut_double_clicked(self, item):
-        """双击列表加载并选择 LUT"""
-        path = item.data(Qt.UserRole)
+    def on_lut_double_clicked(self, item, column):
+        """双击加载LUT（仅文件）"""
+        path = item.data(0, Qt.UserRole)
+        item_type = item.data(0, Qt.UserRole + 2)
+        
+        # 只有文件才能加载
+        if item_type != "file" or not path:
+            return
+        
         try:
             self.lut_table, self.lut_size = parse_cube_lut(path)
             self.log(f"已选择 LUT: {os.path.basename(path)} (尺寸: {self.lut_size}^3)")
+            
+            # 如果已加载图像，自动预览
+            if self.source_image is not None:
+                self._apply_lut_preview()
         except Exception as e:
             self.log(f"[错误] 加载 LUT 失败: {e}")
-
+    
+    @Slot(object)
+    def on_lut_context_menu(self, position):
+        """显示右键菜单"""
+        item = self.lut_tree.itemAt(position)
+        if not item:
+            return
+        
+        path = item.data(0, Qt.UserRole)
+        is_pinned = item.data(0, Qt.UserRole + 1)
+        item_type = item.data(0, Qt.UserRole + 2)
+        
+        menu = QMenu(self)
+        
+        # 只有文件才能置顶
+        if item_type == "file":
+            if is_pinned:
+                pin_action = QAction("取消置顶", self)
+                pin_action.triggered.connect(lambda: self.on_unpin_lut(path))
+            else:
+                pin_action = QAction("📌 置顶", self)
+                pin_action.triggered.connect(lambda: self.on_pin_lut(path))
+            menu.addAction(pin_action)
+            menu.addSeparator()
+        
+        # 检查是否在自定义目录
+        is_custom = path and path.startswith(self.custom_lut_dir) if path else False
+        
+        # 重命名（仅自定义）
+        if is_custom and item_type in ["file", "folder"]:
+            rename_action = QAction("✏️ 重命名", self)
+            if item_type == "file":
+                rename_action.triggered.connect(lambda: self.on_rename_lut(path))
+            else:
+                rename_action.triggered.connect(lambda: self.on_rename_folder(path))
+            menu.addAction(rename_action)
+        
+        # 删除（仅自定义）
+        if is_custom and item_type in ["file", "folder"]:
+            delete_action = QAction("🗑️ 删除", self)
+            if item_type == "file":
+                delete_action.triggered.connect(lambda: self.on_delete_lut_context(path))
+            else:
+                delete_action.triggered.connect(lambda: self.on_delete_folder(path))
+            menu.addAction(delete_action)
+        
+        if not menu.isEmpty():
+            menu.exec(self.lut_tree.viewport().mapToGlobal(position))
+    
+    def on_pin_lut(self, path):
+        """置顶LUT"""
+        self.pinned_luts.add(path)
+        self._save_config()
+        self._load_lut_tree()
+        self.log(f"已置顶: {os.path.basename(path)}")
+    
+    def on_unpin_lut(self, path):
+        """取消置顶LUT"""
+        self.pinned_luts.discard(path)
+        self._save_config()
+        self._load_lut_tree()
+        self.log(f"已取消置顶: {os.path.basename(path)}")
+    
+    def on_rename_lut(self, old_path):
+        """重命名LUT"""
+        old_name = os.path.basename(old_path)
+        name_without_ext = os.path.splitext(old_name)[0]
+        
+        new_name, ok = QInputDialog.getText(
+            self, "重命名 LUT", "输入新名称:",
+            text=name_without_ext
+        )
+        
+        if not ok or not new_name.strip():
+            return
+        
+        new_name = new_name.strip()
+        if not new_name.endswith('.cube'):
+            new_name += '.cube'
+        
+        new_path = os.path.join(os.path.dirname(old_path), new_name)
+        
+        if os.path.exists(new_path):
+            self.log(f"[错误] 文件名已存在: {new_name}")
+            return
+        
+        try:
+            os.rename(old_path, new_path)
+            
+            # 更新置顶列表中的路径
+            if old_path in self.pinned_luts:
+                self.pinned_luts.discard(old_path)
+                self.pinned_luts.add(new_path)
+                self._save_config()
+            
+            self._load_lut_tree()
+            self.log(f"重命名成功: {old_name} → {new_name}")
+        except Exception as e:
+            self.log(f"[错误] 重命名失败: {e}")
+    
+    def on_rename_folder(self, old_path):
+        """重命名文件夹"""
+        old_name = os.path.basename(old_path)
+        
+        new_name, ok = QInputDialog.getText(
+            self, "重命名文件夹", "输入新名称:",
+            text=old_name
+        )
+        
+        if not ok or not new_name.strip():
+            return
+        
+        new_name = new_name.strip()
+        new_path = os.path.join(os.path.dirname(old_path), new_name)
+        
+        if os.path.exists(new_path):
+            self.log(f"[错误] 文件夹名已存在: {new_name}")
+            return
+        
+        try:
+            os.rename(old_path, new_path)
+            
+            # 更新置顶列表中所有受影响的路径
+            updated_pinned = set()
+            for pinned_path in self.pinned_luts:
+                if pinned_path.startswith(old_path + os.sep):
+                    new_pinned = pinned_path.replace(old_path, new_path, 1)
+                    updated_pinned.add(new_pinned)
+                else:
+                    updated_pinned.add(pinned_path)
+            self.pinned_luts = updated_pinned
+            self._save_config()
+            
+            self._load_lut_tree()
+            self.log(f"文件夹重命名成功: {old_name} → {new_name}")
+        except Exception as e:
+            self.log(f"[错误] 重命名失败: {e}")
+    
+    def on_rename_folder(self, old_path):
+        """重命名文件夹"""
+        old_name = os.path.basename(old_path)
+        
+        new_name, ok = QInputDialog.getText(
+            self, "重命名文件夹", "输入新名称:",
+            text=old_name
+        )
+        
+        if not ok or not new_name.strip():
+            return
+        
+        new_name = new_name.strip()
+        new_path = os.path.join(os.path.dirname(old_path), new_name)
+        
+        if os.path.exists(new_path):
+            self.log(f"[错误] 文件夹名已存在: {new_name}")
+            return
+        
+        try:
+            os.rename(old_path, new_path)
+            
+            # 更新置顶列表中所有受影响的路径
+            updated_pinned = set()
+            for pinned_path in self.pinned_luts:
+                if pinned_path.startswith(old_path + os.sep):
+                    new_pinned = pinned_path.replace(old_path, new_path, 1)
+                    updated_pinned.add(new_pinned)
+                else:
+                    updated_pinned.add(pinned_path)
+            self.pinned_luts = updated_pinned
+            self._save_config()
+            
+            self._load_lut_tree()
+            self.log(f"文件夹重命名成功: {old_name} → {new_name}")
+        except Exception as e:
+            self.log(f"[错误] 重命名失败: {e}")
+    
+    def on_delete_lut_context(self, path):
+        """通过右键菜单删除LUT"""
+        if not path.startswith(self.custom_lut_dir):
+            self.log("[警告] 仅支持删除自定义目录中的 LUT")
+            return
+        
+        try:
+            os.remove(path)
+            
+            # 从置顶列表中移除
+            self.pinned_luts.discard(path)
+            self._save_config()
+            
+            self.log(f"已删除 LUT: {os.path.basename(path)}")
+            self._load_lut_list()
+        except Exception as e:
+            self.log(f"[错误] 删除失败: {e}")    
+    def on_delete_folder(self, path):
+        """删除文件夹"""
+        if not path.startswith(self.custom_lut_dir):
+            self.log("[警告] 仅支持删除自定义目录中的文件夹")
+            return
+        
+        try:
+            shutil.rmtree(path)
+            
+            # 从置顶列表中移除所有相关路径
+            self.pinned_luts = {p for p in self.pinned_luts if not p.startswith(path + os.sep)}
+            self._save_config()
+            
+            self.log(f"已删除文件夹: {os.path.basename(path)}")
+            self._load_lut_tree()
+        except Exception as e:
+            self.log(f"[错误] 删除文件夹失败: {e}")
     # ==================== 槽函数 (业务逻辑) ====================
+
+    @Slot(int)
+    def on_strength_changed(self, value):
+        """强度滑块变化时实时预览"""
+        self.lut_strength = value / 100.0
+        self.lbl_strength_value.setText(f"{value}%")
+        
+        # 如果已加载图像和LUT，则实时预览
+        if self.source_image is not None and self.lut_table is not None:
+            self._apply_lut_preview(silent=True)
+    
+    def _apply_lut_preview(self, silent=False):
+        """应用LUT到当前图像（实时预览）"""
+        if hasattr(self, 'worker_thread') and self.worker_thread and self.worker_thread.isRunning():
+            return  # 如果有线程正在运行，跳过
+
+        # 捕获当前滑条强度，避免线程处理中途滑条变化导致不一致
+        strength = self.lut_strength
+
+        self.worker_thread = ImageProcessingThread(
+            self.source_image, self.lut_table, self.lut_size, strength
+        )
+        self.worker_thread.processing_finished.connect(
+            lambda img, s=strength: self.on_preview_finished(img, silent, s)
+        )
+        self.worker_thread.processing_error.connect(self.on_process_error)
+        self.worker_thread.start()
+
+    def _ensure_preview_synced(self):
+        """定时校验预览结果与滑条强度是否一致，不一致则触发预览"""
+        # 未加载图片或LUT、强度控制未显示时跳过
+        if not (self.source_image is not None and self.lut_table is not None):
+            return
+        if not self.strength_slider.isVisible():
+            return
+
+        # 正在处理时跳过，避免争抢线程
+        if hasattr(self, 'worker_thread') and self.worker_thread and self.worker_thread.isRunning():
+            return
+
+        current_strength = self.lut_strength
+
+        # 还未做过任何预览，或当前预览强度与滑条不一致时，触发一次静默预览
+        if self.last_preview_strength is None or abs(current_strength - self.last_preview_strength) > 1e-4:
+            self._apply_lut_preview(silent=True)
 
     @Slot()
     def on_open_image(self):
@@ -313,6 +834,12 @@ class LutAppWindow(QMainWindow):
 
                 self.source_image = image
                 self.lbl_source.set_image(self.source_image)
+                self.last_preview_strength = None  # 重新加载图片后重置预览状态
+                
+                # 显示LUT强度滑块
+                self.lbl_strength_title.setVisible(True)
+                self.strength_slider.setVisible(True)
+                self.lbl_strength_value.setVisible(True)
                 
                 # 判断是否为批处理模式
                 if len(file_paths) > 1:
@@ -335,6 +862,11 @@ class LutAppWindow(QMainWindow):
             try:
                 self.lut_table, self.lut_size = parse_cube_lut(file_path)
                 self.log(f"已加载 LUT: {os.path.basename(file_path)} (尺寸: {self.lut_size}^3)")
+                self.last_preview_strength = None  # 新 LUT 需重新预览
+                
+                # 如果已加载图像，自动预览
+                if self.source_image is not None:
+                    self._apply_lut_preview()
             except Exception as e:
                 self.log(f"[错误] 解析 LUT 失败: {e}")
     
@@ -353,19 +885,26 @@ class LutAppWindow(QMainWindow):
         self.log("正在预览第一张图片的效果...")
         
         # 启动后台线程处理预览
+        strength = self.lut_strength
         self.worker_thread = ImageProcessingThread(
-            self.source_image, self.lut_table, self.lut_size
+            self.source_image, self.lut_table, self.lut_size, strength
         )
-        self.worker_thread.processing_finished.connect(self.on_preview_finished)
+        self.worker_thread.processing_finished.connect(
+            lambda img, s=strength: self.on_preview_finished(img, False, s)
+        )
         self.worker_thread.processing_error.connect(self.on_process_error)
         self.worker_thread.start()
     
     @Slot(object)
-    def on_preview_finished(self, result_image):
+    def on_preview_finished(self, result_image, silent=False, applied_strength=None):
         """预览完成"""
         self.processed_image = result_image
         self.lbl_result.set_image(self.processed_image)
-        self.log("预览完成，如果效果满意可点击'应用处理'批量处理所有图片")
+        self.last_preview_strength = applied_strength if applied_strength is not None else self.lut_strength
+        
+        if not silent:
+            self.log("预览完成，如果效果满意可点击'应用处理'批量处理所有图片")
+        
         self.btn_preview.setEnabled(True)
         self.btn_preview.setText("预览效果")
 
@@ -389,7 +928,7 @@ class LutAppWindow(QMainWindow):
             from lut_processing import BatchProcessingThread
             
             self.worker_thread = BatchProcessingThread(
-                self.image_paths, self.lut_table, self.lut_size
+                self.image_paths, self.lut_table, self.lut_size, self.lut_strength
             )
             self.worker_thread.progress_update.connect(self.on_batch_progress)
             self.worker_thread.processing_finished.connect(self.on_batch_finished)
@@ -399,7 +938,7 @@ class LutAppWindow(QMainWindow):
             # 单张处理模式
             self.log("开始应用 3D LUT，请稍候...")
             self.worker_thread = ImageProcessingThread(
-                self.source_image, self.lut_table, self.lut_size
+                self.source_image, self.lut_table, self.lut_size, self.lut_strength
             )
             self.worker_thread.processing_finished.connect(self.on_process_finished)
             self.worker_thread.processing_error.connect(self.on_process_error)
