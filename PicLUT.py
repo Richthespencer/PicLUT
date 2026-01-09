@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Slot, Qt, QTimer
 from PySide6.QtGui import QAction, QIcon
+from PySide6.QtGui import QDragEnterEvent, QDropEvent
 
 # 导入自定义模块
 from lut_processing import parse_cube_lut, ImageProcessingThread
@@ -64,6 +65,9 @@ class LutAppWindow(QMainWindow):
         self._init_ui()
         self._apply_theme()
         self.preview_sync_timer.start()
+        
+        # 启用拖放功能
+        self.setAcceptDrops(True)
 
     def _init_ui(self):
         """初始化 UI 布局"""
@@ -306,6 +310,112 @@ class LutAppWindow(QMainWindow):
         # 自动滚动到底部
         scrollbar = self.log_viewer.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
+
+    # ==================== 拖放事件处理 ====================
+    
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        """处理拖放进入事件"""
+        if event.mimeData().hasUrls():
+            # 检查是否包含图片文件
+            urls = event.mimeData().urls()
+            for url in urls:
+                file_path = url.toLocalFile()
+                if self._is_image_file(file_path):
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+    
+    def dropEvent(self, event: QDropEvent):
+        """处理拖放释放事件"""
+        urls = event.mimeData().urls()
+        image_files = []
+        lut_files = []
+        
+        # 分类拖放的文件
+        for url in urls:
+            file_path = url.toLocalFile()
+            if self._is_image_file(file_path):
+                image_files.append(file_path)
+            elif self._is_lut_file(file_path):
+                lut_files.append(file_path)
+        
+        # 处理图片文件
+        if image_files:
+            self._load_images_from_paths(image_files)
+        
+        # 处理 LUT 文件
+        if lut_files:
+            # 只加载第一个 LUT 文件
+            self._load_lut_from_path(lut_files[0])
+        
+        event.acceptProposedAction()
+    
+    def _is_image_file(self, file_path: str) -> bool:
+        """判断是否为图片文件"""
+        supported_formats = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp'}
+        _, ext = os.path.splitext(file_path)
+        return ext.lower() in supported_formats
+    
+    def _is_lut_file(self, file_path: str) -> bool:
+        """判断是否为 LUT 文件"""
+        _, ext = os.path.splitext(file_path)
+        return ext.lower() == '.cube'
+    
+    def _load_images_from_paths(self, file_paths: list):
+        """从文件路径加载图片"""
+        try:
+            self.image_paths = file_paths
+            self.loaded_images = []
+            
+            # 加载第一张图片用于预览
+            data = np.fromfile(file_paths[0], dtype=np.uint8)
+            image = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+
+            if image is None:
+                raise ValueError("文件解码失败或格式不支持")
+
+            # 移除可能存在的 Alpha 通道，简化处理
+            if image.shape[-1] == 4:
+                image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+
+            self.source_image = image
+            self.lbl_source.set_image(self.source_image)
+            self.last_preview_strength = None  # 重新加载图片后重置预览状态
+            
+            # 显示LUT强度滑块
+            self.lbl_strength_title.setVisible(True)
+            self.strength_slider.setVisible(True)
+            self.lbl_strength_value.setVisible(True)
+            
+            # 判断是否为批处理模式
+            if len(file_paths) > 1:
+                self.batch_mode = True
+                self.btn_preview.setVisible(True)
+                self.log(f"已拖放 {len(file_paths)} 张图像，显示第一张预览")
+            else:
+                self.batch_mode = False
+                self.btn_preview.setVisible(False)
+                self.log(f"已拖放图像: {os.path.basename(file_paths[0])}")
+            
+            # 如果已加载LUT，自动预览
+            if self.lut_table is not None:
+                self._apply_lut_preview()
+
+        except Exception as e:
+            self.log(f"[错误] 加载图像失败: {e}")
+    
+    def _load_lut_from_path(self, file_path: str):
+        """从文件路径加载 LUT"""
+        try:
+            self.lut_table, self.lut_size = parse_cube_lut(file_path)
+            self.log(f"已拖放 LUT: {os.path.basename(file_path)} (尺寸: {self.lut_size}^3)")
+            self.last_preview_strength = None  # 新 LUT 需重新预览
+            
+            # 如果已加载图像，自动预览
+            if self.source_image is not None:
+                self._apply_lut_preview()
+        except Exception as e:
+            self.log(f"[错误] 加载 LUT 失败: {e}")
 
     # ==================== LUT 管理 ====================
 
