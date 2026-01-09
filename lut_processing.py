@@ -54,7 +54,102 @@ def parse_cube_lut(file_path):
         raise ValueError("文件编码格式不支持")
 
 
-def apply_lut_to_image(source_img, lut_table, lut_size, strength=1.0):
+def apply_ordered_dithering(img_uint8):
+    """
+    应用有序抖动（Ordered Dithering）消除Color Banding，基于Bayer矩阵。
+    
+    Args:
+        img_uint8: uint8 格式的RGB图像 (H, W, 3)
+    
+    Returns:
+        抖动后的uint8图像
+    """
+    # 创建 4x4 Bayer 矩阵
+    bayer_matrix = np.array([
+        [0, 8, 2, 10],
+        [12, 4, 14, 6],
+        [3, 11, 1, 9],
+        [15, 7, 13, 5]
+    ], dtype=np.float32) / 16.0 - 0.5  # 归一化到 [-0.5, 0.5]
+    
+    h, w, c = img_uint8.shape
+    result = img_uint8.astype(np.float32)
+    
+    # 应用Bayer矩阵抖动
+    for y in range(h):
+        for x in range(w):
+            threshold = bayer_matrix[y % 4, x % 4]
+            result[y, x] += threshold * 32  # 32 是量化步长，调整强度
+    
+    # 限制到 [0, 255]
+    result = np.clip(result, 0, 255).astype(np.uint8)
+    return result
+
+
+def apply_noise_dithering(img_uint8, seed=None):
+    """
+    应用噪声抖动消除Color Banding，使用高斯噪声。
+    
+    Args:
+        img_uint8: uint8 格式的RGB图像 (H, W, 3)
+        seed: 随机种子，为None则不固定
+    
+    Returns:
+        抖动后的uint8图像
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    # 生成高斯噪声
+    noise = np.random.normal(0, 1.5, img_uint8.shape).astype(np.float32)
+    result = img_uint8.astype(np.float32) + noise
+    result = np.clip(result, 0, 255).astype(np.uint8)
+    return result
+
+
+def apply_floyd_steinberg_dithering(img_uint8):
+    """
+    应用Floyd-Steinberg抖动（误差扩散）消除Color Banding，高质量但较慢。
+    
+    Args:
+        img_uint8: uint8 格式的RGB图像 (H, W, 3)
+    
+    Returns:
+        抖动后的uint8图像
+    """
+    # 转为float处理
+    img_float = img_uint8.astype(np.float32)
+    result = img_float.copy()
+    
+    h, w, c = img_uint8.shape
+    
+    # 遍历每个像素进行误差扩散
+    for y in range(h):
+        for x in range(w):
+            old_pixel = result[y, x].copy()
+            # 量化到最近的8级
+            new_pixel = np.round(old_pixel / 32) * 32
+            new_pixel = np.clip(new_pixel, 0, 255)
+            result[y, x] = new_pixel
+            
+            # 计算量化误差
+            quant_error = old_pixel - new_pixel
+            
+            # 扩散误差到相邻像素（Floyd-Steinberg权重）
+            if x + 1 < w:
+                result[y, x + 1] += quant_error * 7 / 16
+            if x - 1 >= 0 and y + 1 < h:
+                result[y + 1, x - 1] += quant_error * 3 / 16
+            if y + 1 < h:
+                result[y + 1, x] += quant_error * 5 / 16
+            if x + 1 < w and y + 1 < h:
+                result[y + 1, x + 1] += quant_error * 1 / 16
+    
+    result = np.clip(result, 0, 255).astype(np.uint8)
+    return result
+
+
+def apply_lut_to_image(source_img, lut_table, lut_size, strength=1.0, dithering=None):
     """
     将 3D LUT 应用到图像上。
 
@@ -63,6 +158,7 @@ def apply_lut_to_image(source_img, lut_table, lut_size, strength=1.0):
         lut_table: LUT 数据表
         lut_size: LUT 维度大小
         strength: LUT 强度 (0.0-1.0)，1.0为完全应用
+        dithering: 抖动方法 (None / 'ordered' / 'noise' / 'floyd')
 
     Returns:
         处理后的 OpenCV BGR 格式图像
@@ -89,6 +185,21 @@ def apply_lut_to_image(source_img, lut_table, lut_size, strength=1.0):
     # 5. 根据强度混合原图和处理后的图
     if strength < 1.0:
         result_bgr = cv2.addWeighted(source_img, 1.0 - strength, result_bgr, strength, 0)
+    
+    # 6. 应用抖动消除Color Banding
+    if dithering:
+        # 转为RGB便于处理
+        result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
+        
+        if dithering == 'ordered':
+            result_rgb = apply_ordered_dithering(result_rgb)
+        elif dithering == 'noise':
+            result_rgb = apply_noise_dithering(result_rgb)
+        elif dithering == 'floyd':
+            result_rgb = apply_floyd_steinberg_dithering(result_rgb)
+        
+        # 转回BGR
+        result_bgr = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
 
     return result_bgr
 
@@ -101,12 +212,13 @@ class ImageProcessingThread(QThread):
     processing_finished = Signal(object)  # 成功信号，携带处理后的 OpenCV 图像
     processing_error = Signal(str)  # 失败信号，携带错误信息
 
-    def __init__(self, source_img, lut_table, lut_size, strength=1.0):
+    def __init__(self, source_img, lut_table, lut_size, strength=1.0, dithering=None):
         super().__init__()
         self.source_img = source_img
         self.lut_table = lut_table
         self.lut_size = lut_size
         self.strength = strength
+        self.dithering = dithering
 
     def run(self):
         try:
@@ -114,7 +226,8 @@ class ImageProcessingThread(QThread):
                 self.source_img, 
                 self.lut_table, 
                 self.lut_size,
-                self.strength
+                self.strength,
+                self.dithering
             )
             self.processing_finished.emit(result_bgr)
 
@@ -130,12 +243,13 @@ class BatchProcessingThread(QThread):
     processing_error = Signal(str)  # 失败信号，携带错误信息
     progress_update = Signal(str)  # 进度更新信号
     
-    def __init__(self, image_paths, lut_table, lut_size, strength=1.0):
+    def __init__(self, image_paths, lut_table, lut_size, strength=1.0, dithering=None):
         super().__init__()
         self.image_paths = image_paths
         self.lut_table = lut_table
         self.lut_size = lut_size
         self.strength = strength
+        self.dithering = dithering
     
     def run(self):
         try:
@@ -156,7 +270,7 @@ class BatchProcessingThread(QThread):
                         image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
                     
                     # 应用 LUT
-                    result = apply_lut_to_image(image, self.lut_table, self.lut_size, self.strength)
+                    result = apply_lut_to_image(image, self.lut_table, self.lut_size, self.strength, self.dithering)
                     processed_images.append(result)
                     
                     # 发送进度更新

@@ -13,7 +13,7 @@ import numpy as np
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QFileDialog, QListWidget, QListWidgetItem, QLabel,
-    QMenu, QInputDialog, QTreeWidget, QTreeWidgetItem, QSlider
+    QMenu, QInputDialog, QTreeWidget, QTreeWidgetItem, QSlider, QComboBox
 )
 from PySide6.QtCore import Slot, Qt, QTimer
 from PySide6.QtGui import QAction, QIcon
@@ -45,6 +45,9 @@ class LutAppWindow(QMainWindow):
         # LUT 强度
         self.lut_strength = 1.0  # 默认100%
         self.last_preview_strength = None  # 最近一次预览使用的强度
+        
+        # 抖动选项
+        self.dithering_mode = None  # None / 'ordered' / 'noise' / 'floyd'
 
         # LUT 目录
         self._ensure_lut_dirs()
@@ -154,6 +157,28 @@ class LutAppWindow(QMainWindow):
         self.lbl_strength_value.setVisible(False)
         
         right_layout.addLayout(strength_layout)
+
+        # 1.6 去条纹（抖动）选项
+        dithering_layout = QHBoxLayout()
+        dithering_layout.setSpacing(10)
+        
+        self.lbl_dithering_title = QLabel("去条纹:")
+        self.dithering_combo = QComboBox()
+        self.dithering_combo.addItem("无", None)
+        self.dithering_combo.addItem("有序抖动 (快)", "ordered")
+        self.dithering_combo.addItem("噪声抖动 (平衡)", "noise")
+        self.dithering_combo.addItem("Floyd-Steinberg (高质量)", "floyd")
+        self.dithering_combo.setCurrentIndex(0)
+        self.dithering_combo.currentIndexChanged.connect(self.on_dithering_changed)
+        
+        dithering_layout.addWidget(self.lbl_dithering_title)
+        dithering_layout.addWidget(self.dithering_combo, stretch=1)
+        
+        # 初始隐藏抖动控制
+        self.lbl_dithering_title.setVisible(False)
+        self.dithering_combo.setVisible(False)
+        
+        right_layout.addLayout(dithering_layout)
 
         # 2. 控制按钮区域
         btn_layout = QHBoxLayout()
@@ -382,10 +407,12 @@ class LutAppWindow(QMainWindow):
             self.lbl_source.set_image(self.source_image)
             self.last_preview_strength = None  # 重新加载图片后重置预览状态
             
-            # 显示LUT强度滑块
+            # 显示LUT强度滑块和抖动控制
             self.lbl_strength_title.setVisible(True)
             self.strength_slider.setVisible(True)
             self.lbl_strength_value.setVisible(True)
+            self.lbl_dithering_title.setVisible(True)
+            self.dithering_combo.setVisible(True)
             
             # 判断是否为批处理模式
             if len(file_paths) > 1:
@@ -885,6 +912,15 @@ class LutAppWindow(QMainWindow):
         if self.source_image is not None and self.lut_table is not None:
             self._apply_lut_preview(silent=True)
     
+    @Slot(int)
+    def on_dithering_changed(self, index):
+        """抖动模式变化时更新设置并预览"""
+        self.dithering_mode = self.dithering_combo.currentData()
+        
+        # 如果已加载图像和LUT，则实时预览
+        if self.source_image is not None and self.lut_table is not None:
+            self._apply_lut_preview(silent=True)
+    
     def _apply_lut_preview(self, silent=False):
         """应用LUT到当前图像（实时预览）"""
         if hasattr(self, 'worker_thread') and self.worker_thread and self.worker_thread.isRunning():
@@ -894,7 +930,7 @@ class LutAppWindow(QMainWindow):
         strength = self.lut_strength
 
         self.worker_thread = ImageProcessingThread(
-            self.source_image, self.lut_table, self.lut_size, strength
+            self.source_image, self.lut_table, self.lut_size, strength, self.dithering_mode
         )
         self.worker_thread.processing_finished.connect(
             lambda img, s=strength: self.on_preview_finished(img, silent, s)
@@ -946,10 +982,12 @@ class LutAppWindow(QMainWindow):
                 self.lbl_source.set_image(self.source_image)
                 self.last_preview_strength = None  # 重新加载图片后重置预览状态
                 
-                # 显示LUT强度滑块
+                # 显示LUT强度滑块和抖动控制
                 self.lbl_strength_title.setVisible(True)
                 self.strength_slider.setVisible(True)
                 self.lbl_strength_value.setVisible(True)
+                self.lbl_dithering_title.setVisible(True)
+                self.dithering_combo.setVisible(True)
                 
                 # 判断是否为批处理模式
                 if len(file_paths) > 1:
@@ -997,7 +1035,7 @@ class LutAppWindow(QMainWindow):
         # 启动后台线程处理预览
         strength = self.lut_strength
         self.worker_thread = ImageProcessingThread(
-            self.source_image, self.lut_table, self.lut_size, strength
+            self.source_image, self.lut_table, self.lut_size, strength, self.dithering_mode
         )
         self.worker_thread.processing_finished.connect(
             lambda img, s=strength: self.on_preview_finished(img, False, s)
@@ -1038,7 +1076,7 @@ class LutAppWindow(QMainWindow):
             from lut_processing import BatchProcessingThread
             
             self.worker_thread = BatchProcessingThread(
-                self.image_paths, self.lut_table, self.lut_size, self.lut_strength
+                self.image_paths, self.lut_table, self.lut_size, self.lut_strength, self.dithering_mode
             )
             self.worker_thread.progress_update.connect(self.on_batch_progress)
             self.worker_thread.processing_finished.connect(self.on_batch_finished)
@@ -1048,7 +1086,7 @@ class LutAppWindow(QMainWindow):
             # 单张处理模式
             self.log("开始应用 3D LUT，请稍候...")
             self.worker_thread = ImageProcessingThread(
-                self.source_image, self.lut_table, self.lut_size, self.lut_strength
+                self.source_image, self.lut_table, self.lut_size, self.lut_strength, self.dithering_mode
             )
             self.worker_thread.processing_finished.connect(self.on_process_finished)
             self.worker_thread.processing_error.connect(self.on_process_error)
