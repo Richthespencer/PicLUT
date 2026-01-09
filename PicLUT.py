@@ -13,7 +13,7 @@ import numpy as np
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QFileDialog, QListWidget, QListWidgetItem, QLabel,
-    QMenu, QInputDialog, QTreeWidget, QTreeWidgetItem, QSlider, QComboBox
+    QMenu, QInputDialog, QTreeWidget, QTreeWidgetItem, QSlider, QCheckBox
 )
 from PySide6.QtCore import Slot, Qt, QTimer
 from PySide6.QtGui import QAction, QIcon
@@ -46,8 +46,8 @@ class LutAppWindow(QMainWindow):
         self.lut_strength = 1.0  # 默认100%
         self.last_preview_strength = None  # 最近一次预览使用的强度
         
-        # 抖动选项
-        self.dithering_mode = None  # None / 'ordered' / 'noise' / 'floyd'
+        # Debanding 选项
+        self.debanding_enabled = False
 
         # LUT 目录
         self._ensure_lut_dirs()
@@ -151,34 +151,19 @@ class LutAppWindow(QMainWindow):
         strength_layout.addWidget(self.strength_slider, stretch=1)
         strength_layout.addWidget(self.lbl_strength_value)
         
-        # 初始隐藏强度控制
+        # Debanding 复选框
+        self.chk_debanding = QCheckBox("Debanding (消除色带)")
+        self.chk_debanding.setChecked(False)
+        self.chk_debanding.stateChanged.connect(self.on_debanding_changed)
+        strength_layout.addWidget(self.chk_debanding)
+        
+        # 初始隐藏强度控制和debanding选项
         self.lbl_strength_title.setVisible(False)
         self.strength_slider.setVisible(False)
         self.lbl_strength_value.setVisible(False)
+        self.chk_debanding.setVisible(False)
         
         right_layout.addLayout(strength_layout)
-
-        # 1.6 去条纹（抖动）选项
-        dithering_layout = QHBoxLayout()
-        dithering_layout.setSpacing(10)
-        
-        self.lbl_dithering_title = QLabel("去条纹:")
-        self.dithering_combo = QComboBox()
-        self.dithering_combo.addItem("无", None)
-        self.dithering_combo.addItem("有序抖动 (快)", "ordered")
-        self.dithering_combo.addItem("噪声抖动 (平衡)", "noise")
-        self.dithering_combo.addItem("Floyd-Steinberg (高质量)", "floyd")
-        self.dithering_combo.setCurrentIndex(0)
-        self.dithering_combo.currentIndexChanged.connect(self.on_dithering_changed)
-        
-        dithering_layout.addWidget(self.lbl_dithering_title)
-        dithering_layout.addWidget(self.dithering_combo, stretch=1)
-        
-        # 初始隐藏抖动控制
-        self.lbl_dithering_title.setVisible(False)
-        self.dithering_combo.setVisible(False)
-        
-        right_layout.addLayout(dithering_layout)
 
         # 2. 控制按钮区域
         btn_layout = QHBoxLayout()
@@ -407,12 +392,11 @@ class LutAppWindow(QMainWindow):
             self.lbl_source.set_image(self.source_image)
             self.last_preview_strength = None  # 重新加载图片后重置预览状态
             
-            # 显示LUT强度滑块和抖动控制
+            # 显示LUT强度滑块和debanding选项
             self.lbl_strength_title.setVisible(True)
             self.strength_slider.setVisible(True)
             self.lbl_strength_value.setVisible(True)
-            self.lbl_dithering_title.setVisible(True)
-            self.dithering_combo.setVisible(True)
+            self.chk_debanding.setVisible(True)
             
             # 判断是否为批处理模式
             if len(file_paths) > 1:
@@ -913,9 +897,10 @@ class LutAppWindow(QMainWindow):
             self._apply_lut_preview(silent=True)
     
     @Slot(int)
-    def on_dithering_changed(self, index):
-        """抖动模式变化时更新设置并预览"""
-        self.dithering_mode = self.dithering_combo.currentData()
+    def on_debanding_changed(self, state):
+        """Debanding选项变化时实时预览"""
+        self.debanding_enabled = (state == Qt.Checked.value)  # Qt.Checked.value = 2
+        self.log(f"Debanding 设置已{'启用' if self.debanding_enabled else '禁用'}")
         
         # 如果已加载图像和LUT，则实时预览
         if self.source_image is not None and self.lut_table is not None:
@@ -928,9 +913,14 @@ class LutAppWindow(QMainWindow):
 
         # 捕获当前滑条强度，避免线程处理中途滑条变化导致不一致
         strength = self.lut_strength
+        debanding = self.debanding_enabled
+
+        # 创建新线程前，确保旧线程已被正确清理
+        if hasattr(self, 'worker_thread') and self.worker_thread:
+            self.worker_thread.deleteLater()
 
         self.worker_thread = ImageProcessingThread(
-            self.source_image, self.lut_table, self.lut_size, strength, self.dithering_mode
+            self.source_image, self.lut_table, self.lut_size, strength, debanding
         )
         self.worker_thread.processing_finished.connect(
             lambda img, s=strength: self.on_preview_finished(img, silent, s)
@@ -982,12 +972,11 @@ class LutAppWindow(QMainWindow):
                 self.lbl_source.set_image(self.source_image)
                 self.last_preview_strength = None  # 重新加载图片后重置预览状态
                 
-                # 显示LUT强度滑块和抖动控制
+                # 显示LUT强度滑块和debanding选项
                 self.lbl_strength_title.setVisible(True)
                 self.strength_slider.setVisible(True)
                 self.lbl_strength_value.setVisible(True)
-                self.lbl_dithering_title.setVisible(True)
-                self.dithering_combo.setVisible(True)
+                self.chk_debanding.setVisible(True)
                 
                 # 判断是否为批处理模式
                 if len(file_paths) > 1:
@@ -1034,8 +1023,9 @@ class LutAppWindow(QMainWindow):
         
         # 启动后台线程处理预览
         strength = self.lut_strength
+        debanding = self.debanding_enabled
         self.worker_thread = ImageProcessingThread(
-            self.source_image, self.lut_table, self.lut_size, strength, self.dithering_mode
+            self.source_image, self.lut_table, self.lut_size, strength, debanding
         )
         self.worker_thread.processing_finished.connect(
             lambda img, s=strength: self.on_preview_finished(img, False, s)
@@ -1051,7 +1041,8 @@ class LutAppWindow(QMainWindow):
         self.last_preview_strength = applied_strength if applied_strength is not None else self.lut_strength
         
         if not silent:
-            self.log("预览完成，如果效果满意可点击'应用处理'批量处理所有图片")
+            debanding_status = "✓ 已启用" if self.debanding_enabled else "✗ 未启用"
+            self.log(f"预览完成 [Debanding: {debanding_status}]，如果效果满意可点击'应用处理'批量处理所有图片")
         
         self.btn_preview.setEnabled(True)
         self.btn_preview.setText("预览效果")
@@ -1068,6 +1059,10 @@ class LutAppWindow(QMainWindow):
         self.btn_process.setEnabled(False)
         self.btn_process.setText("正在处理...")
         
+        # 等待之前的线程完成
+        if hasattr(self, 'worker_thread') and self.worker_thread and self.worker_thread.isRunning():
+            self.worker_thread.wait()
+        
         if self.batch_mode:
             # 批处理模式
             self.log(f"开始批量处理 {len(self.image_paths)} 张图片...")
@@ -1076,7 +1071,7 @@ class LutAppWindow(QMainWindow):
             from lut_processing import BatchProcessingThread
             
             self.worker_thread = BatchProcessingThread(
-                self.image_paths, self.lut_table, self.lut_size, self.lut_strength, self.dithering_mode
+                self.image_paths, self.lut_table, self.lut_size, self.lut_strength, self.debanding_enabled
             )
             self.worker_thread.progress_update.connect(self.on_batch_progress)
             self.worker_thread.processing_finished.connect(self.on_batch_finished)
@@ -1086,7 +1081,7 @@ class LutAppWindow(QMainWindow):
             # 单张处理模式
             self.log("开始应用 3D LUT，请稍候...")
             self.worker_thread = ImageProcessingThread(
-                self.source_image, self.lut_table, self.lut_size, self.lut_strength, self.dithering_mode
+                self.source_image, self.lut_table, self.lut_size, self.lut_strength, self.debanding_enabled
             )
             self.worker_thread.processing_finished.connect(self.on_process_finished)
             self.worker_thread.processing_error.connect(self.on_process_error)
@@ -1096,7 +1091,8 @@ class LutAppWindow(QMainWindow):
     def on_process_finished(self, result_image):
         self.processed_image = result_image
         self.lbl_result.set_image(self.processed_image)
-        self.log("处理完成")
+        debanding_status = "✓ 已启用" if self.debanding_enabled else "✗ 未启用"
+        self.log(f"处理完成 [Debanding: {debanding_status}]")
         self._reset_process_btn()
     
     @Slot(str)

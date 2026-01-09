@@ -54,102 +54,75 @@ def parse_cube_lut(file_path):
         raise ValueError("文件编码格式不支持")
 
 
-def apply_ordered_dithering(img_uint8):
+def apply_edge_preserving_debanding(image):
     """
-    应用有序抖动（Ordered Dithering）消除Color Banding，基于Bayer矩阵。
+    使用 Domain Transform Filter + 梯度重建进行 Debanding 处理。
+    在平坦渐变区域强力平滑色带，在边缘和纹理区域保留细节。
     
     Args:
-        img_uint8: uint8 格式的RGB图像 (H, W, 3)
+        image: OpenCV BGR 格式的图像 (uint8)
     
     Returns:
-        抖动后的uint8图像
+        处理后的 OpenCV BGR 格式图像 (uint8)
     """
-    # 创建 4x4 Bayer 矩阵
-    bayer_matrix = np.array([
-        [0, 8, 2, 10],
-        [12, 4, 14, 6],
-        [3, 11, 1, 9],
-        [15, 7, 13, 5]
-    ], dtype=np.float32) / 16.0 - 0.5  # 归一化到 [-0.5, 0.5]
+    try:
+        # 转换为 float32 以提高精度
+        img_float = image.astype(np.float32)
+        
+        # 1. 使用 Domain Transform Filter 进行边缘保持平滑
+        smoothed = cv2.ximgproc.dtFilter(
+            image,  # guide image
+            image,  # source image
+            sigmaSpatial=30,
+            sigmaColor=30,
+            mode=cv2.ximgproc.DTF_NC,
+            numIters=3
+        ).astype(np.float32)
+        
+        # 2. 计算梯度幅度来检测边缘/纹理区域
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        
+        # 使用 Sobel 算子计算梯度
+        grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+        
+        # 3. 归一化梯度并创建平滑权重掩码
+        # 梯度小的区域（平坦/渐变）-> 权重高 -> 更多平滑
+        # 梯度大的区域（边缘/纹理）-> 权重低 -> 保留原始
+        grad_normalized = gradient_magnitude / (gradient_magnitude.max() + 1e-6)
+        
+        # 使用 sigmoid 函数创建平滑过渡的掩码
+        # threshold 控制边缘检测灵敏度，steepness 控制过渡锐度
+        threshold = 0.05
+        steepness = 30
+        smooth_weight = 1.0 / (1.0 + np.exp(steepness * (grad_normalized - threshold)))
+        
+        # 对掩码进行轻微模糊以避免突变
+        smooth_weight = cv2.GaussianBlur(smooth_weight, (5, 5), 0)
+        
+        # 扩展到3通道
+        smooth_weight_3ch = np.stack([smooth_weight] * 3, axis=-1)
+        
+        # 4. 梯度引导的混合：平坦区域用平滑结果，边缘区域保留原始
+        result_float = smooth_weight_3ch * smoothed + (1 - smooth_weight_3ch) * img_float
+        
+        # 5. 在平坦区域添加微小抖动以打破残余色带
+        # 只在平坦区域添加抖动
+        dither_strength = 1.5
+        dither = np.random.uniform(-dither_strength, dither_strength, img_float.shape).astype(np.float32)
+        result_float = result_float + dither * smooth_weight_3ch
+        
+        result = np.clip(result_float, 0, 255).astype(np.uint8)
+        
+    except AttributeError:
+        # 如果没有安装 opencv-contrib，回退到双边滤波
+        result = cv2.bilateralFilter(image, d=9, sigmaColor=35, sigmaSpace=35)
     
-    h, w, c = img_uint8.shape
-    result = img_uint8.astype(np.float32)
-    
-    # 应用Bayer矩阵抖动
-    for y in range(h):
-        for x in range(w):
-            threshold = bayer_matrix[y % 4, x % 4]
-            result[y, x] += threshold * 32  # 32 是量化步长，调整强度
-    
-    # 限制到 [0, 255]
-    result = np.clip(result, 0, 255).astype(np.uint8)
     return result
 
 
-def apply_noise_dithering(img_uint8, seed=None):
-    """
-    应用噪声抖动消除Color Banding，使用高斯噪声。
-    
-    Args:
-        img_uint8: uint8 格式的RGB图像 (H, W, 3)
-        seed: 随机种子，为None则不固定
-    
-    Returns:
-        抖动后的uint8图像
-    """
-    if seed is not None:
-        np.random.seed(seed)
-    
-    # 生成高斯噪声
-    noise = np.random.normal(0, 1.5, img_uint8.shape).astype(np.float32)
-    result = img_uint8.astype(np.float32) + noise
-    result = np.clip(result, 0, 255).astype(np.uint8)
-    return result
-
-
-def apply_floyd_steinberg_dithering(img_uint8):
-    """
-    应用Floyd-Steinberg抖动（误差扩散）消除Color Banding，高质量但较慢。
-    
-    Args:
-        img_uint8: uint8 格式的RGB图像 (H, W, 3)
-    
-    Returns:
-        抖动后的uint8图像
-    """
-    # 转为float处理
-    img_float = img_uint8.astype(np.float32)
-    result = img_float.copy()
-    
-    h, w, c = img_uint8.shape
-    
-    # 遍历每个像素进行误差扩散
-    for y in range(h):
-        for x in range(w):
-            old_pixel = result[y, x].copy()
-            # 量化到最近的8级
-            new_pixel = np.round(old_pixel / 32) * 32
-            new_pixel = np.clip(new_pixel, 0, 255)
-            result[y, x] = new_pixel
-            
-            # 计算量化误差
-            quant_error = old_pixel - new_pixel
-            
-            # 扩散误差到相邻像素（Floyd-Steinberg权重）
-            if x + 1 < w:
-                result[y, x + 1] += quant_error * 7 / 16
-            if x - 1 >= 0 and y + 1 < h:
-                result[y + 1, x - 1] += quant_error * 3 / 16
-            if y + 1 < h:
-                result[y + 1, x] += quant_error * 5 / 16
-            if x + 1 < w and y + 1 < h:
-                result[y + 1, x + 1] += quant_error * 1 / 16
-    
-    result = np.clip(result, 0, 255).astype(np.uint8)
-    return result
-
-
-def apply_lut_to_image(source_img, lut_table, lut_size, strength=1.0, dithering=None):
+def apply_lut_to_image(source_img, lut_table, lut_size, strength=1.0, debanding=False):
     """
     将 3D LUT 应用到图像上。
 
@@ -158,7 +131,7 @@ def apply_lut_to_image(source_img, lut_table, lut_size, strength=1.0, dithering=
         lut_table: LUT 数据表
         lut_size: LUT 维度大小
         strength: LUT 强度 (0.0-1.0)，1.0为完全应用
-        dithering: 抖动方法 (None / 'ordered' / 'noise' / 'floyd')
+        debanding: 是否启用 Error Diffusion Debanding
 
     Returns:
         处理后的 OpenCV BGR 格式图像
@@ -186,20 +159,9 @@ def apply_lut_to_image(source_img, lut_table, lut_size, strength=1.0, dithering=
     if strength < 1.0:
         result_bgr = cv2.addWeighted(source_img, 1.0 - strength, result_bgr, strength, 0)
     
-    # 6. 应用抖动消除Color Banding
-    if dithering:
-        # 转为RGB便于处理
-        result_rgb = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
-        
-        if dithering == 'ordered':
-            result_rgb = apply_ordered_dithering(result_rgb)
-        elif dithering == 'noise':
-            result_rgb = apply_noise_dithering(result_rgb)
-        elif dithering == 'floyd':
-            result_rgb = apply_floyd_steinberg_dithering(result_rgb)
-        
-        # 转回BGR
-        result_bgr = cv2.cvtColor(result_rgb, cv2.COLOR_RGB2BGR)
+    # 6. 应用 Debanding 处理
+    if debanding:
+        result_bgr = apply_edge_preserving_debanding(result_bgr)
 
     return result_bgr
 
@@ -212,13 +174,13 @@ class ImageProcessingThread(QThread):
     processing_finished = Signal(object)  # 成功信号，携带处理后的 OpenCV 图像
     processing_error = Signal(str)  # 失败信号，携带错误信息
 
-    def __init__(self, source_img, lut_table, lut_size, strength=1.0, dithering=None):
+    def __init__(self, source_img, lut_table, lut_size, strength=1.0, debanding=False):
         super().__init__()
         self.source_img = source_img
         self.lut_table = lut_table
         self.lut_size = lut_size
         self.strength = strength
-        self.dithering = dithering
+        self.debanding = debanding
 
     def run(self):
         try:
@@ -227,7 +189,7 @@ class ImageProcessingThread(QThread):
                 self.lut_table, 
                 self.lut_size,
                 self.strength,
-                self.dithering
+                self.debanding
             )
             self.processing_finished.emit(result_bgr)
 
@@ -243,13 +205,13 @@ class BatchProcessingThread(QThread):
     processing_error = Signal(str)  # 失败信号，携带错误信息
     progress_update = Signal(str)  # 进度更新信号
     
-    def __init__(self, image_paths, lut_table, lut_size, strength=1.0, dithering=None):
+    def __init__(self, image_paths, lut_table, lut_size, strength=1.0, debanding=False):
         super().__init__()
         self.image_paths = image_paths
         self.lut_table = lut_table
         self.lut_size = lut_size
         self.strength = strength
-        self.dithering = dithering
+        self.debanding = debanding
     
     def run(self):
         try:
@@ -270,7 +232,7 @@ class BatchProcessingThread(QThread):
                         image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
                     
                     # 应用 LUT
-                    result = apply_lut_to_image(image, self.lut_table, self.lut_size, self.strength, self.dithering)
+                    result = apply_lut_to_image(image, self.lut_table, self.lut_size, self.strength, self.debanding)
                     processed_images.append(result)
                     
                     # 发送进度更新
