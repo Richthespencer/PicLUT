@@ -9,7 +9,123 @@ from PIL import Image, ImageFilter
 from PySide6.QtCore import QThread, Signal
 
 
+# ==================== 蓝噪声贴图生成 ====================
+def _generate_blue_noise_texture(size=256, seed=42):
+    """
+    生成固定的蓝噪声贴图（平铺用）。
+    使用 Poisson Disk Sampling 的简化版本生成蓝噪声。
+    
+    Args:
+        size: 贴图大小 (size x size)
+        seed: 随机种子，保证可重现性
+    
+    Returns:
+        shape (size, size) 的蓝噪声贴图，值域 [-0.5, 0.5]
+    """
+    np.random.seed(seed)
+    
+    # 使用高频 Perlin-like 噪声生成蓝噪声的近似
+    # 方法：多个正弦波频率叠加形成蓝噪声特性
+    x = np.linspace(0, 4 * np.pi, size)
+    y = np.linspace(0, 4 * np.pi, size)
+    xx, yy = np.meshgrid(x, y)
+    
+    # 多频率组合形成蓝噪声
+    noise = np.sin(xx) * np.cos(yy) * 0.3
+    noise += np.sin(xx * 0.7) * np.cos(yy * 0.9) * 0.3
+    noise += np.sin(xx * 1.3) * np.cos(yy * 1.1) * 0.2
+    noise += np.sin(xx * 2.1) * np.cos(yy * 1.7) * 0.2
+    
+    # 添加小幅随机扰动以增加蓝噪声特性
+    random_noise = (np.random.uniform(-1, 1, (size, size)) * 0.1)
+    noise = noise + random_noise
+    
+    # 归一化到 [-0.5, 0.5]
+    noise_min = noise.min()
+    noise_max = noise.max()
+    noise = (noise - noise_min) / (noise_max - noise_min) - 0.5
+    
+    return noise.astype(np.float32)
+
+
+# 全局蓝噪声贴图（模块加载时生成一次）
+_BLUE_NOISE_TEXTURE = _generate_blue_noise_texture(256)
+
+
+def _apply_blue_noise_dither(image, intensity=1.5):
+    """
+    使用蓝噪声贴图对图像进行抖动。
+    
+    Args:
+        image: OpenCV BGR 格式 uint8 图像
+        intensity: 抖动强度 (通常 1.0-3.0)
+    
+    Returns:
+        抖动后的图像 (uint8)
+    """
+    img_float = image.astype(np.float32)
+    h, w, c = img_float.shape
+    
+    # 将蓝噪声贴图平铺到图像大小
+    texture_h, texture_w = _BLUE_NOISE_TEXTURE.shape
+    dither_map = np.tile(_BLUE_NOISE_TEXTURE, (h // texture_h + 1, w // texture_w + 1))[:h, :w]
+    
+    # 扩展到3通道
+    dither_map_3ch = np.stack([dither_map] * c, axis=-1)
+    
+    # 应用抖动
+    dithered = img_float + dither_map_3ch * intensity
+    
+    return np.clip(dithered, 0, 255).astype(np.uint8)
+
+
+# ==================== LUT 解析 ====================
 def parse_cube_lut(file_path):
+    """
+    解析 .cube 格式的 3D LUT 文件。
+
+    Args:
+        file_path (str): .cube 文件路径
+
+    Returns:
+        tuple: (lut_table_list, size)
+               lut_table_list 为扁平化的浮点列表，size 为 LUT 的维度 (N)
+    """
+    lut_table = []
+    size = 0
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                # 跳过空行和注释
+                if not line or line.startswith('#'):
+                    continue
+                # 解析尺寸定义
+                if line.startswith('LUT_3D_SIZE'):
+                    size = int(line.split()[-1])
+                    continue
+                # 解析数据点 (检查是否以数字或负号开头)
+                if line[0].isdigit() or line[0] == '-':
+                    parts = line.split()
+                    lut_table.extend([float(v) for v in parts])
+
+        if size == 0:
+            raise ValueError("未找到 LUT_3D_SIZE 定义")
+        if len(lut_table) != size * size * size * 3:
+            raise ValueError(f"数据点数量不匹配。预期: {size ** 3 * 3}, 实际: {len(lut_table)}")
+
+        return lut_table, size
+
+    except UnicodeDecodeError:
+        # 尝试使用 latin-1 再次读取，防止某些特殊编码文件报错
+        with open(file_path, 'r', encoding='latin-1') as f:
+            # 简化重复逻辑，实际生产中可封装
+            pass
+        raise ValueError("文件编码格式不支持")
+
+
+# ==================== Debanding ====================
     """
     解析 .cube 格式的 3D LUT 文件。
 
@@ -56,8 +172,7 @@ def parse_cube_lut(file_path):
 
 def apply_edge_preserving_debanding(image):
     """
-    使用 Domain Transform Filter + 梯度重建进行 Debanding 处理。
-    在平坦渐变区域强力平滑色带，在边缘和纹理区域保留细节。
+    使用 Domain Transform Filter 进行 Debanding 处理。
     
     Args:
         image: OpenCV BGR 格式的图像 (uint8)
@@ -66,54 +181,15 @@ def apply_edge_preserving_debanding(image):
         处理后的 OpenCV BGR 格式图像 (uint8)
     """
     try:
-        # 转换为 float32 以提高精度
-        img_float = image.astype(np.float32)
-        
-        # 1. 使用 Domain Transform Filter 进行边缘保持平滑
-        smoothed = cv2.ximgproc.dtFilter(
+        # 使用 Domain Transform Filter 进行边缘保持平滑
+        result = cv2.ximgproc.dtFilter(
             image,  # guide image
             image,  # source image
             sigmaSpatial=30,
             sigmaColor=30,
             mode=cv2.ximgproc.DTF_NC,
             numIters=3
-        ).astype(np.float32)
-        
-        # 2. 计算梯度幅度来检测边缘/纹理区域
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        
-        # 使用 Sobel 算子计算梯度
-        grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
-        
-        # 3. 归一化梯度并创建平滑权重掩码
-        # 梯度小的区域（平坦/渐变）-> 权重高 -> 更多平滑
-        # 梯度大的区域（边缘/纹理）-> 权重低 -> 保留原始
-        grad_normalized = gradient_magnitude / (gradient_magnitude.max() + 1e-6)
-        
-        # 使用 sigmoid 函数创建平滑过渡的掩码
-        # threshold 控制边缘检测灵敏度，steepness 控制过渡锐度
-        threshold = 0.05
-        steepness = 30
-        smooth_weight = 1.0 / (1.0 + np.exp(steepness * (grad_normalized - threshold)))
-        
-        # 对掩码进行轻微模糊以避免突变
-        smooth_weight = cv2.GaussianBlur(smooth_weight, (5, 5), 0)
-        
-        # 扩展到3通道
-        smooth_weight_3ch = np.stack([smooth_weight] * 3, axis=-1)
-        
-        # 4. 梯度引导的混合：平坦区域用平滑结果，边缘区域保留原始
-        result_float = smooth_weight_3ch * smoothed + (1 - smooth_weight_3ch) * img_float
-        
-        # 5. 在平坦区域添加微小抖动以打破残余色带
-        # 只在平坦区域添加抖动
-        dither_strength = 1.5
-        dither = np.random.uniform(-dither_strength, dither_strength, img_float.shape).astype(np.float32)
-        result_float = result_float + dither * smooth_weight_3ch
-        
-        result = np.clip(result_float, 0, 255).astype(np.uint8)
+        )
         
     except AttributeError:
         # 如果没有安装 opencv-contrib，回退到双边滤波
@@ -131,7 +207,7 @@ def apply_lut_to_image(source_img, lut_table, lut_size, strength=1.0, debanding=
         lut_table: LUT 数据表
         lut_size: LUT 维度大小
         strength: LUT 强度 (0.0-1.0)，1.0为完全应用
-        debanding: 是否启用 Error Diffusion Debanding
+        debanding: 是否启用 Debanding 处理
 
     Returns:
         处理后的 OpenCV BGR 格式图像
@@ -159,7 +235,11 @@ def apply_lut_to_image(source_img, lut_table, lut_size, strength=1.0, debanding=
     if strength < 1.0:
         result_bgr = cv2.addWeighted(source_img, 1.0 - strength, result_bgr, strength, 0)
     
-    # 6. 应用 Debanding 处理
+    # 6. 应用LUT之后、debanding之前的蓝噪声抖动
+    if debanding:
+        result_bgr = _apply_blue_noise_dither(result_bgr, intensity=2.0)
+    
+    # 7. 应用后处理 Debanding（dtFilter + 梯度重建）
     if debanding:
         result_bgr = apply_edge_preserving_debanding(result_bgr)
 

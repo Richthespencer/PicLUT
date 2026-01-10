@@ -14,7 +14,7 @@
 - 实时预览与对比，后台线程处理避免界面卡顿。
 - 暗色系 UI，带自适应图像缩放控件。
 - LUT 强度滑块（0-100%）：实时预览，快速拖动也会自动校验并同步到最新强度。
-- Debanding 功能：使用 Domain Transform Filter + 梯度重建算法，消除渐变区域的色带（Color Banding），同时保留边缘和纹理细节。
+- Debanding 功能：在 LUT 应用后采用蓝噪声抖动 + Domain Transform Filter 处理，消除渐变区域的色带（Color Banding）。
 
 ---
 
